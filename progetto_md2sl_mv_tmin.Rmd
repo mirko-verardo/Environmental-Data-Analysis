@@ -1,0 +1,606 @@
+---
+title: "Progetto Environmental Data Analysis (MD2SL)"
+subtitle: "Temperatura MINIMA"
+author: "Mirko Verardo"
+date: "24 gennaio 2025"
+output: 
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r librerie, message = FALSE, warning = FALSE}
+
+# librerie per manipolazione dati
+library(tidyverse)
+library(corrplot)
+# librerie per modeling
+library(caret)
+library(xgboost)
+# librerie per gestione mappa
+library(sf)
+library(ggspatial)
+
+```
+
+# Lettura dataset
+
+In questa sezione vengono letti tutti i dataset necessari per l'analisi. In particolare:
+
+-   il dataset per il training, del quale sono state considerate solo le variabili presenti nel file *Descrizione_Predittori.docx*
+-   il dataset con la griglia sf della Toscana
+-   il dataset con i predittori per il comune di Firenze
+
+```{r read, message = FALSE, warning = FALSE}
+
+# path current directory
+PATH = "C:/Users/mirko/Desktop/md2sl/environmental_and_genomic_data_analysis/sera/Exercise"
+
+file = paste(PATH, "dataTempTuscany_tmin.RData", sep="/")
+load(file)
+
+file = paste(PATH, "Tuscany_grid_sf.RData", sep="/")
+load(file)
+tuscanygridsp = tuscanygridsp %>% select(cellcode, geometry)
+
+file = paste(PATH, "DF_predictor_FI_2022_183.rds", sep="/")
+data_firenze = readRDS(file)
+
+# tengo solo la geometria di firenze
+data_firenze = data_firenze %>%
+  inner_join(tuscanygridsp, by = c("cellcode"))
+rm(tuscanygridsp)
+
+# elenco predittori
+predictors_all = c(
+  "calllat",    		                 # latitudine del centroide della cella
+  "calllong",   		                 # longitudine del centroide della cella
+  "ibu",        		                 # % area della cella con costruzioni non naturali
+  "dem",        		                 # altitudine
+  "slp",        		                 # pendenza
+  "asp",        		                 # direzione massima pendenza
+  "svf",        		                 # sky view factor
+  "lenght_urbana",  			           # lunghezza strade urbane
+  "lenght_locale",  			           # lunghezza strade locali
+  "lenght_extraurbana_secondaria",  
+  "lenght_extraurbana_principale", 
+  "lenght_autostrada",              
+  "lenght_altro",                  
+  "pop",         			               # popolazione
+  "ntl",         			               # night time light
+  "Continuous_urban_fabric",         # % area urbana continua
+  "Discontinuous_urban_fabric",      # % area urbana discontinua
+  "Industrial_or_commercial_units",  # % area industriale o commerciale
+  "Mineral_extraction_sites",        # % area miniera
+  "Dump_sites",                      # % area discarica
+  "Vegetation",                      # % area vegetazione
+  "Agriculture",                     # % area agricoltura
+  "Wet_land",                        # % area palude
+  "Beaches_dunes_sands",             # % area spiaggia
+  "Water",                           # % area acqua
+  "isa",                             # % area impervious surface
+  "SUNALT",                          # altezza del sole alle 12
+  "AZIM",                            # azimuth alle 12
+  "DAYL",                            # durata del giorno
+  "DIFSUNRAD",		                   # radiazione solare diffusa
+  "DIRSUNRAD",                       # radiazione solare diretta
+  "TMEAN",                           # ERA5-land temperatura media
+  "PREC",                            # ERA5-land precipitazioni
+  "RH",                              # ERA5-land umidità relativa
+  "WINDS",                           # ERA5-land velocità del vento
+  "WINDD",                           # ERA5-land direzione del vento
+  "PA",                              # ERA5-pressione atmosferica
+  "NDVI",                            # indice di vegetazione NDVI-da satellite
+  "BLH",                             # ERA5-land planet bounday layer
+  "DEW",                             # ERA5-land dew point temperature
+  "LST_AD",                          # Satellite Aqua-MODIS LST day
+  "LST_AN",                          # Satellite Aqua-MODIS LST night
+  "LST_TD",                          # Satellite Terra-MODIS LST day
+  "LST_TN",                          # Satellite Terra-MODIS LST night
+  "ERA5_Tmax",                       # ERA5-land temperatura massima
+  "ERA5_Tmin",                       # ERA5-land temperatura minima
+  "centraline_w_mean_max",           # media delle 10 centraline vicine -tmax
+  "centraline_w_mean_min",           # media delle 10 centraline vicine -tmin
+  "landsat"                          # LST dal satellite Landsat 8-stagione
+)
+
+# tengo solo le variabili d'interesse
+vars = c(
+  "cellcode",   		                 # codice della cella 100mX100m
+  "IDStazione", 		                 # codice della centralina
+  "Data",                            # data della rilevazione
+  "temp_min",   		                 # temperatura minima misurata dalla centralina
+  predictors_all
+)
+DT.min = DT.min %>% select(all_of(vars))
+
+# tengo solo le variabili d'interesse
+vars = c(
+  "cellcode", 
+  "geometry", 
+  predictors_all
+)
+data_firenze = data_firenze %>% select(all_of(vars))
+
+```
+
+# Analisi esplorativa
+
+```{r init, message = FALSE, warning = FALSE}
+
+# inizialization
+data = DT.min
+response_var = "temp_min"
+
+data = data %>%
+  mutate(stagione = factor(case_when(
+    month(Data) %in% c(12, 1, 2) ~ "inverno",
+    month(Data) %in% c(3, 4, 5)  ~ "primavera",
+    month(Data) %in% c(6, 7, 8)  ~ "estate",
+    month(Data) %in% c(9, 10, 11) ~ "autunno"
+  ), levels = c(
+    "inverno", 
+    "primavera", 
+    "estate",
+    "autunno"
+  )))
+
+data_firenze = data_firenze %>%
+  mutate(stagione = factor("estate", levels = c(
+    "inverno", 
+    "primavera", 
+    "estate",
+    "autunno"
+  )))
+
+str(data)
+
+# range di date presenti nel dataset
+data_days = data$Data
+print(min(data_days))
+print(max(data_days))
+
+```
+
+## Variabile risposta
+
+```{r response, message = FALSE, warning = FALSE}
+
+# set visualization
+par(mfrow = c(1, 2))
+
+# response
+data_response = data[[response_var]]
+summary(data_response)
+hist(data_response, main = "Histogram", xlab = response_var, ylab = "")
+boxplot(data_response, main = "Boxplot", xlab = response_var, ylab = "")
+
+```
+
+## Predittori
+
+```{r predictors, message = FALSE, warning = FALSE, fig.height = 28, fig.width = 20}
+
+# set visualization
+par(mfrow = c(4, 2), cex = 2)
+
+# predictors plots
+for (predictor in predictors_all) {
+  hist(data[[predictor]], main = predictor, xlab = "", ylab = "")
+  boxplot(data[[predictor]], main = predictor, xlab = "", ylab = "")
+}
+
+# reset visualization
+par(mfrow = c(1, 1), cex = 1)
+
+```
+
+I seguenti predittori contengono degli outlier potenzialmente poco sensati:
+
+-   **LST_AD**: Satellite Aqua-MODIS LST day
+-   **LST_TD**: Satellite Terra-MODIS LST day
+
+Anziché rimuovere le relative osservazioni o sostituirle con un valore medio (ad esempio), è stato pensato di rimuovere questi predittori dal modello in virtù del fatto che verranno inclusi invece **LST_AN** e **LST_TN**, ovvero l'equivalente ma con i dati notturni (probabilmente anche più significativi per le temperature minime).
+
+# Selezione delle variabili
+
+## Base
+
+```{r var_sel_base, message = FALSE, warning = FALSE}
+
+predictors = predictors_all
+print(predictors)
+
+# predittori che contengono outlier
+predictors_del = c("LST_AD", "LST_TD")
+predictors = predictors[!(predictors %in% predictors_del)]
+
+# predittori poco informativi
+predictors_del = nearZeroVar(data[, ..predictors], names=T, saveMetrics=T) %>% 
+  filter(nzv) %>% 
+  rownames()
+predictors = predictors[!(predictors %in% predictors_del)]
+
+# nessuna combinazione lineare da togliere
+print(findLinearCombos(data[, ..predictors]))
+
+# predittori che secondo me non servono
+predictors_del = c("calllat", "calllong", "centraline_w_mean_max")
+predictors = predictors[!(predictors %in% predictors_del)]
+print(predictors)
+
+```
+
+Oltre ai predittori contenenti outlier poco sensati, sono stati rimossi alcuni predittori poco informativi nel dataset (pochi valori univoci e valore più frequente presente in oltre il 95% delle osservazioni).\
+Inoltre, è stato ritenuto opportuno rimuovere i valori di **latitudine** e **longitudine**.\
+Infine, per un ragionamento simile a quello fatto per LST_AD e LST_TD, è stato ritenuto opportuno rimuovere anche **centraline_w_mean_max** (media tmax delle 10 centraline vicine).
+
+## Gestione Multicollinearità
+
+```{r var_sel_multi, message = FALSE, warning = FALSE}
+
+formula = paste(response_var, paste(predictors, collapse = " + "), sep=" ~ ")
+model = lm(as.formula(formula), data)
+print(paste("VIF (all):", mean(car::vif(model))))
+
+corr_predictors = cor(data[, ..predictors], method="pearson")
+corrplot(corr_predictors, type="upper", tl.col="black", tl.srt=45, tl.cex=0.5)
+
+predictors_del = findCorrelation(corr_predictors, cutoff=0.9, names=T)
+predictors_sel = predictors[!(predictors %in% predictors_del)]
+
+formula = paste(response_var, paste(predictors_sel, collapse = " + "), sep=" ~ ")
+model = lm(as.formula(formula), data)
+print(paste("VIF (sel):", mean(car::vif(model))))
+
+corr_predictors = cor(data[, ..predictors_sel], method="pearson")
+corrplot(corr_predictors, type="upper", tl.col="black", tl.srt=45, tl.cex=0.5)
+
+print(predictors_sel)
+
+```
+
+È stata misurata la multicollinearità attraverso l'indice **VIF (Variance Inflance Factor)** che risulta molto elevato. Anche la matrice di correlazione mostra elevata correlazione tra diverse coppie di predittori.\
+In seguito alla rimozione dei predittori con correlazione superiore a 0.9, l'indice VIF risulta inferiore a 5 e, per tanto, mostra un livello di multicollinearità accettabile.
+
+# Training
+
+## Funzioni di supporto
+
+Da notare, il cambio della funzione di **standardizzazione**, basata sui valori del training set.
+
+```{r functions, message = FALSE, warning = FALSE}
+
+# max-min standardization
+normalize = function(X, mins = c(), maxs = c()) {
+  if (length(mins) == 0)
+    mins = min(X)
+  
+  if (length(maxs) == 0)
+    maxs = max(X)
+  
+  return ((X - mins) / (maxs - mins))
+}
+
+# check the model performance
+check_ml_model = function(ml_model, X, y) {
+  y_pred = predict(ml_model, X)
+  metrics = postResample(y_pred, y)
+  return(metrics)
+}
+
+# check the model on firenze temperatures map
+check_ml_model_firenze = function(ml_model, data, features, title) {
+  # add predictions
+  data = data %>% mutate(temp = predict(ml_model, features))
+  
+  # need to convert it to an sf object for the map
+  data = st_as_sf(data)
+  
+  # colors
+  colors = c("darkblue", "cyan3", "lightyellow")
+  
+  # get the plot
+  p = ggplot(data = data) +
+    geom_sf(aes(fill = temp, color = temp)) +
+    scale_fill_gradientn(colors = colors, values = c(0, 0.5, 1)) +
+    scale_color_gradientn(colors = colors, values = c(0, 0.5, 1)) +
+    theme_minimal() +
+    ggtitle(title)
+  
+  # return the plot
+  return (p)
+}
+
+```
+
+## Standardizzazione
+
+La standardizzazione verrà eseguita sia per i predittori filtrati dopo la gestione di multicollinearità, sia per i predittori prima.
+
+```{r stdz, message = TRUE, warning = TRUE}
+
+SEED = 2025
+
+# TRAINING-TEST SPLITTING
+set.seed(SEED)
+random.test = runif(nrow(data))
+test = data[random.test >= 0.7, ]
+train = data[random.test < 0.7, ]
+
+# OUTCOMES
+train.outcome = train[[response_var]]
+test.outcome = test[[response_var]]
+
+# TRAINING
+train.features = train[, ..predictors]
+train.features.range = list(
+  min = apply(train.features, 2, min),
+  max = apply(train.features, 2, max)
+)
+train.features_sel = train[, ..predictors_sel]
+train.features_sel.range = list(
+  min = apply(train.features_sel, 2, min),
+  max = apply(train.features_sel, 2, max)
+)
+
+# TEST
+test.features = test[, ..predictors]
+test.features_sel = test[, ..predictors_sel]
+
+# TRAINING STANDARDIZATION
+train.features = mapply(
+  normalize,
+  train.features,
+  mins = train.features.range$min,
+  maxs = train.features.range$max
+)
+train.features_sel = mapply(
+  normalize,
+  train.features_sel,
+  mins = train.features_sel.range$min,
+  maxs = train.features_sel.range$max
+)
+
+# TEST STANDARDIZATION
+test.features = mapply(
+  normalize,
+  test.features,
+  mins = train.features.range$min,
+  maxs = train.features.range$max
+)
+test.features_sel = mapply(
+  normalize,
+  test.features_sel,
+  mins = train.features_sel.range$min,
+  maxs = train.features_sel.range$max
+)
+
+train.features = cbind(train.features, train$stagione)
+train.features_sel = cbind(train.features_sel, train$stagione)
+test.features = cbind(test.features, test$stagione)
+test.features_sel = cbind(test.features_sel, test$stagione)
+
+# TRAINING STANDARDIZATION DATAFRAME
+train.features = as.data.frame(train.features)
+train.features_sel = as.data.frame(train.features_sel)
+
+# TEST STANDARDIZATION DATAFRAME
+test.features = as.data.frame(test.features)
+test.features_sel = as.data.frame(test.features_sel)
+
+# TRAINING PARAMS
+step_control = trainControl(
+  method="repeatedcv",
+  repeats=5,
+  number=5, 
+  returnResamp="final"
+)
+
+```
+
+Da notare che per i modelli **Lineare**, **Stepwise Forward** ed **Elastic Net**, il processo di **cross-validation** viene ripetuto con diverse suddivisioni.
+
+## Modello Lineare
+
+Sono state inserite nel modello solo i predittori selezionati in seguito alla gestione di multicollinearità.
+
+```{r lineare, message = TRUE, warning = TRUE}
+
+set.seed(SEED)
+
+# get the model and check on train, test and firenze
+linear_model = train(train.features_sel, train.outcome, "lm", 
+                     trControl = step_control)
+
+# print metrics
+train_m = check_ml_model(linear_model, train.features_sel, train.outcome)
+test_m = check_ml_model(linear_model, test.features_sel, test.outcome)
+df = as.data.frame(rbind(train_m, test_m), row.names = c("TRAIN", "TEST"))
+print(df)
+
+# print coefs
+coefs = coef(linear_model$finalModel)
+df = as.data.frame(coefs[-1])
+colnames(df) = c("COEFFICIENTS")
+print(df %>% arrange(-abs(COEFFICIENTS)))
+
+```
+
+## Modello Stepwise Forward
+
+Sono state inserite nel modello solo i predittori selezionati in seguito alla gestione di multicollinearità.
+
+```{r stepwise, message = TRUE, warning = TRUE}
+
+set.seed(SEED)
+
+# set the params
+step_grid = data.frame(nvmax = 1:length(train.features_sel))
+
+# get the model and check on train, test and firenze
+leapf_model = train(train.features_sel, train.outcome, "leapForward", 
+                    tuneGrid = step_grid, trControl = step_control)
+# plot results
+p = plot(leapf_model)
+print(p)
+
+# print metrics
+train_m = check_ml_model(leapf_model, train.features_sel, train.outcome)
+test_m = check_ml_model(leapf_model, test.features_sel, test.outcome)
+df = as.data.frame(rbind(train_m, test_m), row.names = c("TRAIN", "TEST"))
+print(df)
+
+# print coefs
+coefs = coef(leapf_model$finalModel, unlist(leapf_model$bestTune))
+df = as.data.frame(coefs[-1])
+colnames(df) = c("COEFFICIENTS")
+print(df %>% arrange(-abs(COEFFICIENTS)))
+
+```
+
+## Modello Elastic Net
+
+Sono state inserite nel modello i predittori selezionati prima della gestione di multicollinearità.\
+Infatti, il modello Elastic Net è poco sensibile a multicollinearità e riesce a gestire anche variabili correlate tra loro.\
+In particolare:
+
+-   $\alpha \in [0, 1]$: bilanciamento tra Ridge ($\alpha = 0$) e Lasso ($\alpha = 1$):
+    -   $\alpha = 0$: solo Ridge (regolarizzazione **L2**).
+    -   $\alpha = 1$: solo Lasso (regolarizzazione **L1**).
+    -   $0 < \alpha < 1$: sia Ridge sia Lasso (**Elastic Net**).
+-   $\lambda \geq 0$: parametro che regola il peso complessivo della penalizzazione.
+
+```{r glmnet, message = TRUE, warning = TRUE}
+
+set.seed(SEED)
+
+# set the params
+step_grid = expand.grid(
+  alpha = seq(0, 1, by = 0.1), # Ridge-Lasso (0-1) regression
+  lambda = seq(0.5, 1.5, by = 0.1) # Grid of lambda values to test
+)
+
+# get the model and check on train, test and firenze
+glmnet_model = train(train.features, train.outcome, "glmnet", 
+                     tuneGrid = step_grid, trControl = step_control)
+# plot results
+p = plot(glmnet_model)
+print(p)
+
+# print metrics
+train_m = check_ml_model(glmnet_model, train.features, train.outcome)
+test_m = check_ml_model(glmnet_model, test.features, test.outcome)
+df = as.data.frame(rbind(train_m, test_m), row.names = c("TRAIN", "TEST"))
+print(df)
+
+# print coefs (S4 object)
+fm = glmnet_model$finalModel
+
+print(glmnet_model$bestTune)
+print(fm$lambdaOpt)
+
+coefs = as.matrix(coef(fm, fm$lambdaOpt))
+df = as.data.frame(coefs[-1, ])
+colnames(df) = c("COEFFICIENTS")
+print(df %>% arrange(-abs(COEFFICIENTS)))
+
+```
+
+## Modello xGBoost
+
+Sono state inserite nel modello i predittori selezionati prima della gestione di multicollinearità.\
+Infatti, il modello xGBoost è poco sensibile a multicollinearità e riesce a gestire anche variabili correlate tra loro.
+
+```{r xgboost, message = TRUE, warning = TRUE}
+
+set.seed(SEED)
+
+# set the params
+xgb.params = list(
+  objective = "reg:squarederror",
+  booster = "gbtree",
+  eval_metric = "rmse",
+  eta = 0.1,
+  min_child_weight = 100,
+  max_depth = 10,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  gamma = 0.01
+)
+
+# get the model
+xgb_model = xgb.train(
+  params = xgb.params, 
+  data = xgb.DMatrix(
+    data = as.matrix(train.features),
+    label = train.outcome
+  ), 
+  nrounds = 1000
+)
+
+# print metrics
+train_m = check_ml_model(xgb_model, as.matrix(train.features), train.outcome)
+test_m = check_ml_model(xgb_model, as.matrix(test.features), test.outcome)
+df = as.data.frame(rbind(train_m, test_m), row.names = c("TRAIN", "TEST"))
+print(df)
+
+# print gain
+df = xgb.importance(feature_names = c(predictors, "stagione"), model = xgb_model)
+print(df)
+
+```
+
+# Predizione su Firenze
+
+```{r check_firenze, message = TRUE, warning = TRUE}
+#, eval=FALSE
+
+features = data_firenze[, ..predictors]
+features_sel = data_firenze[, ..predictors_sel]
+
+# STANDARDIZATION
+features = mapply(
+  normalize,
+  features,
+  mins = train.features.range$min,
+  maxs = train.features.range$max
+)
+features_sel = mapply(
+  normalize,
+  features_sel,
+  mins = train.features_sel.range$min,
+  maxs = train.features_sel.range$max
+)
+
+features = cbind(features, data_firenze$stagione)
+features_sel = cbind(features_sel, data_firenze$stagione)
+
+# STANDARDIZATION DATAFRAME
+features = as.data.frame(features)
+features_sel = as.data.frame(features_sel)
+
+# set common title
+title = paste("Firenze", response_var, sep=" - ")
+
+t = paste(title, "Linear", sep = " - ")
+p = check_ml_model_firenze(linear_model, data_firenze, features_sel, t)
+print(p)
+
+t = paste(title, "Stepwise Forward", sep = " - ")
+p = check_ml_model_firenze(leapf_model, data_firenze, features_sel, t)
+print(p)
+
+t = paste(title, "Elastic Net", sep = " - ")
+p = check_ml_model_firenze(glmnet_model, data_firenze, features, t)
+print(p)
+
+t = paste(title, "XGBoost", sep = " - ")
+p = check_ml_model_firenze(xgb_model, data_firenze, as.matrix(features), t)
+print(p)
+
+```
